@@ -1,0 +1,557 @@
+# Vidsync
+
+A React Native (Expo) application for capturing video recordings, storing metadata locally, and reliably synchronizing recordings to cloud storage using presigned S3 uploads.
+
+The project demonstrates mobile video capture, offline-first queue processing, SQLite persistence, retry handling, and AWS infrastructure design patterns commonly used in production telemetry and media ingestion systems.
+
+---
+
+## Features
+
+### Authentication
+
+- Email-based mock login
+- Session persistence across app restarts
+- Secure credential storage using Expo SecureStore
+
+### Video Capture
+
+- Start/stop video recording
+- Front/rear camera switching
+- Recording timer
+- Automatic save after recording completes
+- Metadata collection per recording
+
+### Local Persistence
+
+- SQLite database via Expo SQLite
+- Offline-first architecture
+- Persistent upload queue
+- Retry tracking and upload state management
+
+### Upload & Sync Engine
+
+- Presigned URL upload flow
+- Persistent queue across app restarts
+- Exponential retry backoff
+- Upload state tracking
+- Idempotent uploads using video_id
+
+### Video Dashboard
+
+- Paginated video listing
+- Upload status indicators
+- Retry failed uploads
+- Delete local recordings
+
+---
+
+# Architecture
+
+```text
+Camera
+   │
+   ▼
+Local File Storage
+   │
+   ▼
+SQLite Metadata Store
+   │
+   ▼
+Upload Queue
+   │
+   ▼
+Backend API
+   │
+   ▼
+Presigned URL
+   │
+   ▼
+Amazon S3
+```
+
+Recording data is first persisted locally before any upload attempt occurs. This guarantees recordings survive app crashes, network outages, and device restarts.
+
+---
+
+# Project Structure
+
+```text
+src/
+├── db/
+│   ├── database.ts
+│   └── schema.ts
+│
+├── screens/
+│   ├── CameraScreen.tsx
+│   └── DashboardScreen.tsx
+│
+├── services/
+│   ├── auth.ts
+│   ├── api.ts
+│   ├── storage.ts
+│   └── syncEngine.ts
+│
+└── navigation/
+```
+
+---
+
+# Video Metadata
+
+Each recording stores:
+
+| Field             | Purpose                   |
+| ----------------- | ------------------------- |
+| video_id          | UUID v4 unique identifier |
+| worker_id         | User identifier           |
+| started_at        | Recording start timestamp |
+| ended_at          | Recording end timestamp   |
+| duration_ms       | Recording duration        |
+| file_size_bytes   | File size                 |
+| fps               | Frames per second         |
+| fps_tier          | low / standard / high     |
+| device_model      | Device model              |
+| os_version        | OS version                |
+| resolution        | Recording resolution      |
+| local_path        | Persistent file location  |
+| metadata_json     | Extensible metadata       |
+| upload_state      | Queue state               |
+| attempt_count     | Retry count               |
+| last_error        | Most recent failure       |
+| last_attempted_at | Retry timestamp           |
+
+---
+
+# Database Design
+
+## Schema
+
+The application uses a single `videos` table as the source of truth for both recording metadata and upload state.
+
+### Primary Key
+
+```sql
+video_id TEXT PRIMARY KEY
+```
+
+Each video receives a UUID at capture time and is used throughout the system as the idempotency key.
+
+---
+
+## Indexes
+
+### upload_state
+
+```sql
+CREATE INDEX idx_upload_state
+ON videos(upload_state);
+```
+
+Reason:
+
+The sync engine continuously queries videos waiting to upload.
+
+```sql
+SELECT *
+FROM videos
+WHERE upload_state IN ('PENDING', 'FAILED');
+```
+
+Without an index this becomes a full table scan.
+
+---
+
+### started_at
+
+```sql
+CREATE INDEX idx_started_at
+ON videos(started_at DESC);
+```
+
+Reason:
+
+Dashboard pagination sorts by newest recordings.
+
+```sql
+SELECT *
+FROM videos
+ORDER BY started_at DESC
+LIMIT ? OFFSET ?;
+```
+
+This avoids sorting the entire table on every request.
+
+---
+
+# Query Optimization Example
+
+Dashboard queries use pagination:
+
+```sql
+SELECT *
+FROM videos
+ORDER BY started_at DESC
+LIMIT ? OFFSET ?;
+```
+
+Benefits:
+
+- Constant memory usage
+- Faster dashboard rendering
+- Scales to large datasets
+- Avoids loading entire history into memory
+
+---
+
+# Schema Migration Strategy
+
+SQLite schema changes are versioned using:
+
+```sql
+PRAGMA user_version;
+```
+
+Example migration:
+
+```sql
+ALTER TABLE videos
+ADD COLUMN gps_accuracy REAL;
+```
+
+Then:
+
+```sql
+PRAGMA user_version = 2;
+```
+
+Existing rows automatically receive NULL values, avoiding expensive table rewrites.
+
+Migration flow:
+
+1. Check current schema version
+2. Run required migrations
+3. Update user_version
+4. Continue app startup
+
+This approach safely handles tens of thousands of existing records during app updates.
+
+---
+
+# Upload Flow
+
+```text
+App
+  │
+  ▼
+Backend API
+  │
+  ▼
+Presigned URL
+  │
+  ▼
+PUT Upload
+  │
+  ▼
+Amazon S3
+```
+
+Steps:
+
+1. Recording completes
+2. Metadata saved to SQLite
+3. Upload state set to PENDING
+4. Sync engine requests presigned URL
+5. App uploads directly to S3
+6. Upload marked UPLOADED
+
+---
+
+# Upload States
+
+| State     | Description           |
+| --------- | --------------------- |
+| PENDING   | Awaiting upload       |
+| UPLOADING | Transfer in progress  |
+| UPLOADED  | Successfully uploaded |
+| FAILED    | Upload failed         |
+
+State transitions are one-way.
+
+A video marked `UPLOADED` never returns to `PENDING`.
+
+---
+
+# Retry Strategy
+
+Exponential backoff:
+
+```text
+2s
+4s
+8s
+16s
+32s
+64s
+```
+
+Formula:
+
+```text
+min(2^attempt_count, 64)
+```
+
+Benefits:
+
+- Prevents backend overload
+- Handles temporary outages
+- Conserves battery and network usage
+
+---
+
+# Idempotency Strategy
+
+`video_id` acts as the unique upload identifier.
+
+Example S3 object:
+
+```text
+workers/worker_007/2026-06-20/<video_id>.mp4
+```
+
+Re-uploading the same video produces the same destination object, preventing duplicates.
+
+---
+
+# AWS Infrastructure Design
+
+## S3 Bucket Design
+
+### Bucket Strategy
+
+Single bucket:
+
+```text
+vidsync-telemetry-videos-prod
+```
+
+Reason:
+
+- Simpler operations
+- Easier lifecycle management
+- Easier monitoring
+- Supports required scale comfortably
+
+### Key Structure
+
+```text
+workers/{worker_id}/{yyyy-mm-dd}/{video_id}.mp4
+```
+
+Example:
+
+```text
+workers/worker_007/2026-06-20/abc123.mp4
+```
+
+Benefits:
+
+- Worker isolation
+- Logical partitioning
+- Efficient debugging
+- Human-readable organization
+
+---
+
+## IAM & Security
+
+### Least Privilege
+
+Presigned URL generator requires:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::vidsync-telemetry-videos-prod/workers/*"]
+    }
+  ]
+}
+```
+
+### URL Scope
+
+Backend generates object keys using authenticated worker IDs.
+
+Workers never choose arbitrary S3 paths.
+
+### URL TTL
+
+Recommended:
+
+```text
+5 minutes
+```
+
+Long enough for a 60-second upload while minimizing exposure.
+
+---
+
+## Storage Cost Strategy
+
+Assumptions:
+
+```text
+10,000 workers
+20 videos/day
+50 MB/video
+```
+
+Daily:
+
+```text
+10 TB/day
+```
+
+Monthly:
+
+```text
+~300 TB/month
+```
+
+After 90 days:
+
+```text
+~900 TB stored
+```
+
+### Lifecycle Policy
+
+```text
+0-30 days      → Standard
+30-90 days     → Standard-IA
+90+ days       → Deep Archive
+```
+
+This minimizes long-term storage costs.
+
+---
+
+## Upload Confirmation
+
+Approach used:
+
+### HTTP Success + ETag Verification
+
+1. S3 returns success response
+2. Client receives ETag
+3. Upload marked UPLOADED
+
+Advantages:
+
+- Simple
+- Low latency
+- No additional infrastructure
+
+For larger production systems:
+
+```text
+S3 Event
+   ▼
+Lambda
+   ▼
+Metadata Database
+```
+
+could be introduced for stronger guarantees.
+
+---
+
+## Presigned URL Generator
+
+Implemented using:
+
+```python
+boto3.client("s3").generate_presigned_url(...)
+```
+
+Generates scoped PUT URLs for:
+
+```text
+worker_id
+video_id
+```
+
+and limits uploads to the intended object path.
+
+---
+
+# Scalability Discussion
+
+At larger scale the likely bottlenecks are:
+
+1. Backend presigned URL generation throughput
+2. Mobile network bandwidth
+3. Dashboard pagination queries
+4. Upload retry storms during outages
+
+Amazon S3 itself is unlikely to be the first bottleneck.
+
+Potential future improvements:
+
+- Multipart uploads
+- Background upload workers
+- Event-driven sync engine
+- Upload batching
+- Dedicated metadata service
+
+---
+
+# Tech Stack
+
+- React Native
+- Expo
+- TypeScript
+- Expo Camera
+- Expo SQLite
+- Expo SecureStore
+- FastAPI
+- AWS S3
+- Terraform
+
+---
+
+# Running Locally
+
+```bash
+npm install
+npx expo start
+```
+
+Backend:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+---
+
+# Future Improvements
+
+- Multipart uploads
+- Background task integration
+- GPS metadata collection
+- Network type tracking
+- Battery telemetry
+- Upload progress indicators
+- S3 event-driven confirmations
+- Video compression/transcoding pipeline
+- Cloud metadata persistence
+- Push-based sync architecture
+
+```
+
+```
